@@ -1,6 +1,10 @@
 param(
     [string]$DataDirectory = (Join-Path $PSScriptRoot 'source_data'),
-    [string]$OutputDirectory = $PSScriptRoot
+    [string]$OutputDirectory = $PSScriptRoot,
+    [datetime]$AsOfDate = [datetime]::Today,
+    [string[]]$EligibleVehicleClasses = @('Motor Cycle/Scooter-Used For Hire'),
+    [switch]$IncludeIncompleteYears,
+    [switch]$IncludeUnidentifiedMakers
 )
 
 $ErrorActionPreference = 'Stop'
@@ -335,3 +339,77 @@ $outputRows | Group-Object Year | ForEach-Object {
 } | Format-Table -AutoSize
 Write-Output "Created $outputPath with $($outputRows.Count) unique rows and $totalCount registrations."
 Write-Output "Created $reportPath."
+
+$electricFuels = @('ELECTRIC(BOV)', 'PURE EV')
+$nonElectricFuels = @('PETROL', 'DIESEL', 'CNG', 'LPG', 'PETROL/CNG', 'PETROL/LPG')
+$completeYears = @{}
+foreach ($year in 2024..2026) {
+    $coverage = @($tables["maker_monthWise_${year}_all_records.csv"].Dimensions | ForEach-Object {
+        [datetime]::ParseExact($_, 'yyyy-MMM', [System.Globalization.CultureInfo]::InvariantCulture).Month
+    } | Sort-Object -Unique)
+    $completeYears[$year] = $coverage.Count -eq 12 -and $year -lt $AsOfDate.Year
+}
+$cleanMakerSources = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::Ordinal)
+$cleanRows = @($outputRows | ForEach-Object {
+    $row = $_
+    $makerClean = (($row.Maker.Trim().ToUpperInvariant() -replace '\.', '') -replace '\s+', ' ')
+    $makerClean = $makerClean -replace '\bPRIVATE\b', 'PVT' -replace '\bLIMITED\b', 'LTD'
+    if ($cleanMakerSources.ContainsKey($makerClean) -and $cleanMakerSources[$makerClean] -cne $row.Maker) {
+        throw "Maker normalization collision requiring review: $makerClean"
+    }
+    $cleanMakerSources[$makerClean] = $row.Maker
+    $fuelTable = $tables["maker_vehicleFuel_$($row.Year)_all_records.csv"]
+    $fuelRecord = $fuelTable.Records[$row.Maker]
+    $fuelCandidates = @($fuelTable.Dimensions | Where-Object { $fuelRecord.$_ -gt 0 })
+    if ($row.'Fuel Type' -ne '') { $fuelCandidates = @($row.'Fuel Type') }
+    $evFlag = 'Unknown'
+    if ($fuelCandidates.Count -gt 0 -and @($fuelCandidates | Where-Object { $_ -notin $electricFuels }).Count -eq 0) {
+        $evFlag = 'Electric'
+    } elseif ($fuelCandidates.Count -gt 0 -and @($fuelCandidates | Where-Object { $_ -notin $nonElectricFuels }).Count -eq 0) {
+        $evFlag = 'Non-electric'
+    }
+    $eligible = $evFlag -eq 'Electric' -and $row.'Vehicle Class' -in $EligibleVehicleClasses
+    $complete = $completeYears[[int]$row.Year]
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    if ($evFlag -ne 'Electric') { $reasons.Add("EV classification: $evFlag") }
+    if ($row.'Vehicle Class' -notin $EligibleVehicleClasses) { $reasons.Add('Vehicle class excluded by analysis policy') }
+    if (-not $complete -and -not $IncludeIncompleteYears) { $reasons.Add('Incomplete calendar-year coverage') }
+    if ($makerClean -in @('OTHERS', 'OTHER', 'UNKNOWN', '') -and -not $IncludeUnidentifiedMakers) { $reasons.Add('Unidentified manufacturer') }
+    $cleanCategory = 'Unknown'
+    if ($row.'Vehicle Class' -in @('Motor Cycle/Scooter-SideCar(T)', 'Motor Cycle/Scooter-With Trailer')) { $cleanCategory = 'other' }
+    $clean = [ordered]@{}
+    foreach ($column in $expectedColumns) { $clean[$column] = $row.$column }
+    $clean['Maker_Clean'] = $makerClean
+    $clean['EV_Flag'] = $evFlag
+    $clean['E2W_Eligible'] = if ($eligible) { 'Yes' } else { 'No' }
+    $clean['Model_Clean'] = ($row.Model.Trim().ToUpperInvariant() -replace '\s+', ' ')
+    $clean['Complete_Year_Flag'] = if ($complete) { 'Yes' } else { 'No' }
+    $clean['Include_Main_Analysis'] = if ($reasons.Count -eq 0) { 'Yes' } else { 'No' }
+    $clean['Exclusion_Reason'] = $reasons -join '; '
+    $clean['Maker_EV_Status'] = 'Unknown'
+    $clean['Battery_Capacity_Band'] = ''
+    $clean['Vehicle_Category_Clean'] = $cleanCategory
+    [pscustomobject]$clean
+})
+$cleanKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+foreach ($row in $cleanRows) {
+    if (-not $cleanKeys.Add("$($row.Year)`t$($row.Month)`t$($row.Maker_Clean)`t$($row.'Vehicle Class')")) { throw 'Duplicate clean master key' }
+    if (($row.Include_Main_Analysis -eq 'Yes') -ne ($row.Exclusion_Reason -eq '')) { throw 'Inconsistent exclusion flag' }
+}
+if ($cleanRows.Count -ne $outputRows.Count -or ($cleanRows | Measure-Object -Property 'Registration Count / Value' -Sum).Sum -ne $totalCount) { throw 'Clean master changed source counts' }
+$cleanPath = Join-Path $OutputDirectory '02_VAHAN_MASTER_CLEAN.csv'
+$cleanRows | Export-Csv -LiteralPath $cleanPath -NoTypeInformation -Encoding UTF8
+$cleanReloaded = @(Import-Csv -LiteralPath $cleanPath)
+$cleanColumns = @($cleanRows[0].PSObject.Properties.Name)
+if ($cleanReloaded.Count -ne $cleanRows.Count -or $cleanColumns.Count -ne 23 -or ($cleanReloaded[0].PSObject.Properties.Name -join '|') -cne ($cleanColumns -join '|')) { throw 'Clean CSV schema or row count mismatch' }
+for ($rowIndex = 0; $rowIndex -lt $cleanRows.Count; $rowIndex++) {
+    foreach ($column in $cleanColumns) {
+        if ([string]$cleanReloaded[$rowIndex].$column -cne [string]$cleanRows[$rowIndex].$column) { throw "Clean CSV round-trip mismatch: $rowIndex / $column" }
+    }
+}
+Write-Output "Created $cleanPath with $($cleanRows.Count) rows and $totalCount registrations."
+Write-Output 'Policy: configured eligible classes; completed 12-month calendar years unless overridden; unidentified makers excluded unless overridden.'
+Write-Output 'Maker_EV_Status is Unknown because EV-filtered exports cannot establish manufacturer-wide fuel coverage. Combined motorcycle/scooter labels remain Unknown; model and battery bands are unavailable.'
+$cleanRows | Group-Object Include_Main_Analysis | ForEach-Object {
+    [pscustomobject]@{ Include_Main_Analysis = $_.Name; Rows = $_.Count; Registrations = ($_.Group | Measure-Object -Property 'Registration Count / Value' -Sum).Sum }
+} | Format-Table -AutoSize
